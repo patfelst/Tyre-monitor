@@ -14,7 +14,7 @@
 
 #define firmware_version      "v0.1"
 #define firmware_date         __DATE__
-#define firmware_ver_and_date firmware_version ", " firmware_date
+#define firmware_ver_and_date "Firmware " firmware_version ", " firmware_date
 
 #define NUM_TYRE_SAMPLES        4    // The number of samples to take upon button click
 #define TYRE_SAMPLE_PERIOD_MS   250  // Period between each pressure/temperature sample
