@@ -12,7 +12,13 @@
 #include "Adafruit_MCP9600.h"
 #include "hsc_ssc_i2c.h"
 
-#define TYRE_SAMPLE_PERIOD_MS 250
+#define firmware_version      "v0.1"
+#define firmware_date         __DATE__
+#define firmware_ver_and_date firmware_version ", " firmware_date
+
+#define NUM_TYRE_SAMPLES        4    // The number of samples to take upon button click
+#define TYRE_SAMPLE_PERIOD_MS   250  // Period between each pressure/temperature sample
+#define PRESSURE_THRESHOLD_PSIG 0.2  // Threshold above which pressure is reported over BLE instead of temperature
 uint32_t last_sample_time = 0;
 uint32_t message_update_time = 0;
 bool never_connected = true;
@@ -135,7 +141,8 @@ void setup() {
   while (!Serial) {
     delay(10);
   }
-  Serial.println("");
+  Serial.println(firmware_ver_and_date);
+  Serial.println();
 
   /********************************************************************
               INITIALISE Honeywell HSC Pressure Sensor
@@ -244,10 +251,8 @@ void send_ble_data_2() {
     // Initial measurement to see if pressure sensor is attached to tyre
     gauge_pressure = read_hsc_gauge(SLAVE_ADDR, atmos_pressure);
 
-    // Take 4 measurements over 1 second
-    // if (gauge_pressure > 5.0) {
-    if (gauge_pressure > 0.2) {
-      for (uint8_t n = 0; n < 4; n++) {
+    if (gauge_pressure > PRESSURE_THRESHOLD_PSIG) {
+      for (uint8_t n = 0; n < NUM_TYRE_SAMPLES; n++) {
         gauge_pressure = read_hsc_gauge(SLAVE_ADDR, atmos_pressure);
         // SEND CSV FORMATTED ASCII FOR ADAFRUIT BLUEFRUIT CONNECT APP
         send_value = (uint16_t)(gauge_pressure * 100.0);
@@ -258,7 +263,7 @@ void send_ble_data_2() {
         delay(TYRE_SAMPLE_PERIOD_MS);
       }
     } else {
-      for (uint8_t n = 0; n < 4; n++) {
+      for (uint8_t n = 0; n < NUM_TYRE_SAMPLES; n++) {
         read_thermocouple(&thermocouple_temp, nullptr);
         // SEND CSV FORMATTED ASCII FOR ADAFRUIT BLUEFRUIT CONNECT APP
         send_value = (uint16_t)(thermocouple_temp * 100.0);
