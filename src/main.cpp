@@ -12,19 +12,21 @@
 #include "Adafruit_MCP9600.h"
 #include "hsc_ssc_i2c.h"
 
-#define firmware_version      "v0.1"
+#define firmware_version      "v0.11"
 #define firmware_date         __DATE__
 #define firmware_ver_and_date "Firmware " firmware_version ", " firmware_date
 
 #define NUM_TYRE_SAMPLES        4    // The number of samples to take upon button click
 #define TYRE_SAMPLE_PERIOD_MS   250  // Period between each pressure/temperature sample
 #define PRESSURE_THRESHOLD_PSIG 0.2  // Threshold above which pressure is reported over BLE instead of temperature
+#define BLE_TX_FORMAT_READABLE  0
+#define BLE_TX_FORMAT_CSV       1
+#define BLE_TX_FORMAT_INTEGER   2
 uint32_t last_sample_time = 0;
 uint32_t message_update_time = 0;
 bool never_connected = true;
 void tyre_deep_sleep();
 void send_ble_data();
-void send_ble_data_2();
 
 // User push button
 #define BUTTON_GPIO_PIN 33
@@ -76,7 +78,6 @@ void flash_LED(uint32_t color, uint8_t brightness_percent, uint8_t freq, int16_t
 // Setup Honywell HSCMAND060PA3A3 60psi absolute pressure sensor
 // see hsc_ssc_i2c.h for a description of these values
 #define SLAVE_ADDR 0x38
-uint8_t hsc_status;
 float atmos_pressure;
 
 class MyServerCallbacks : public BLEServerCallbacks {
@@ -94,29 +95,33 @@ class MyServerCallbacks : public BLEServerCallbacks {
 class MyCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
     std::string rxValue = pCharacteristic->getValue();
-
+    char c;
     if (rxValue.length() > 0) {
-      Serial.println("*********");
-      Serial.print("Received UART value: ");
-      for (int i = 0; i < rxValue.length(); i++)
-        Serial.print(rxValue[i]);
-      Serial.println();
-      Serial.println("*********");
+      Serial.println("************************");
+      Serial.print(  "Received UART value \"");
+      for (int i = 0; i < rxValue.length(); i++) {
+        c = rxValue[i];
+        if ((c == '\n') || (c == '\r')) break;
+        Serial.print(c);
+      }
+      Serial.print("\"\n");
+      Serial.println("************************");
 
       // Look for command to change BLE output format
       if (rxValue.length() == 3 && (rxValue[0] == '@')) {
         ble_tx_type = rxValue[1] - '0';
+        Serial.print("Switching to BLE send format: ");
         switch (ble_tx_type) {
-          case 0:
-            Serial.println("Switching to READABLE STRING\n");
+          case BLE_TX_FORMAT_READABLE:
+            Serial.println("READABLE STRING\n");
             break;
 
-          case 1:
-            Serial.println("Switching to CSV FORMAT\n");
+          case BLE_TX_FORMAT_CSV:
+            Serial.println("CSV\n");
             break;
 
-          case 2:
-            Serial.println("Switching to INTEGER ARRAY\n");
+          case BLE_TX_FORMAT_INTEGER:
+            Serial.println("INTEGER ARRAY\n");
             break;
 
           default:
@@ -150,8 +155,8 @@ void setup() {
   // I2C peripheral on GPIO pins SDA = 21, SCL = 22
   Wire.begin(21, 22);
   // Read Atmospheric pressure to calculate gague pressure later on
-  hsc_status = read_hsc_absolute(SLAVE_ADDR, &atmos_pressure, nullptr);
-  if (!hsc_status) Serial.printf("Atmospheric pressure read OK = %.2f psi\n", atmos_pressure);
+  uint8_t hsc_status = read_hsc_absolute(SLAVE_ADDR, &atmos_pressure, nullptr);
+  if (!hsc_status) log_i("Atmospheric pressure read OK = %.2f psi\n", atmos_pressure);
 
   /********************************************************************
               INITIALISE APA102 RGB LED on TinyPico Board
@@ -215,14 +220,13 @@ void setup() {
 
   // Start advertising
   pServer->getAdvertising()->start();
-  Serial.printf("BLE Advertising - Waiting %d seconds for client connection...\n", BLE_CONNECTION_TIMEOUT_SEC);
+  log_i("BLE Advertising - Waiting %d seconds for client connection...\n", BLE_CONNECTION_TIMEOUT_SEC);
 
   /*
   ********************************************************************
   ********************* INITIALISE PUSH BUTTON  **********************
   ********************************************************************
   */
-  //pinMode(BUTTON_GPIO_PIN, INPUT_PULLUP);
   button.attachClick(button_shortpress);
   button.attachDuringLongPress(button_during_long_press);
   button.attachLongPressStart(button_longpress_started);
@@ -235,14 +239,15 @@ void setup() {
 /*
   -----------------
   Send Tyre monitor data via BLE UART service
-  Send pressure if present, else send temperature
+  Send 100 * pressure if present, else send 100 * temperature
   -----------------
 */
-void send_ble_data_2() {
+void send_ble_data() {
   char txt[40];
   float thermocouple_temp;
   float gauge_pressure;
   uint16_t send_value = 0;
+  uint8_t ble_send_array[4];
 
   if (BLE_Connected) {
     // LED is green while measuring
@@ -254,23 +259,59 @@ void send_ble_data_2() {
     if (gauge_pressure > PRESSURE_THRESHOLD_PSIG) {
       for (uint8_t n = 0; n < NUM_TYRE_SAMPLES; n++) {
         gauge_pressure = read_hsc_gauge(SLAVE_ADDR, atmos_pressure);
-        // SEND CSV FORMATTED ASCII FOR ADAFRUIT BLUEFRUIT CONNECT APP
-        send_value = (uint16_t)(gauge_pressure * 100.0);
-        sprintf(txt, "%d,\n", send_value);
-        Serial.printf("CSV format: Gauge Pressure = %d [dec] = %.2f psi\n", send_value, gauge_pressure);
-        pTxCharacteristic->setValue(txt);
-        pTxCharacteristic->notify();
+        send_value = (uint16_t)(round(gauge_pressure * 100.0));
+        if (ble_tx_type == BLE_TX_FORMAT_READABLE) {
+          // SEND PRESSURE IN HUMAN READABLE ASCII
+          Serial.printf("Readable format: [Press=%.2f psi\\n]\n", gauge_pressure);
+          sprintf(txt, "Press=%.2f psi\n", gauge_pressure);
+          pTxCharacteristic->setValue(txt);
+          pTxCharacteristic->notify();
+        } else if (ble_tx_type == BLE_TX_FORMAT_CSV) {
+          // SEND PRESSURE IN CSV FORMATTED ASCII FOR PLOTTING (GRAPHING) IN ADAFRUIT BLUEFRUIT CONNECT APP
+          Serial.printf("CSV format: Gauge Pressure [%d,\\n] ==> %d DEC = %.2f psi\n", send_value, send_value, gauge_pressure);
+          sprintf(txt, "%d,\n", send_value);
+          pTxCharacteristic->setValue(txt);
+          pTxCharacteristic->notify();
+        } else if (ble_tx_type == BLE_TX_FORMAT_INTEGER) {
+          // SEND PRESSURE IN LITTLE ENDIAN INTEGER ARRAY, PREFIXED WITH ASCII "PR"
+          ble_send_array[0] = 'P';
+          ble_send_array[1] = 'R';
+          ble_send_array[2] = send_value;
+          ble_send_array[3] = send_value >> 8;
+          Serial.printf("Integer array format: Gauge Pressure [%c][%c][0x%02X][0x%02X] ==> %d DEC = %.3f psi\n",
+                        ble_send_array[0], ble_send_array[1], ble_send_array[2], ble_send_array[3], send_value, gauge_pressure);
+          pTxCharacteristic->setValue(ble_send_array, sizeof(ble_send_array));
+          pTxCharacteristic->notify();
+        }
         delay(TYRE_SAMPLE_PERIOD_MS);
       }
     } else {
       for (uint8_t n = 0; n < NUM_TYRE_SAMPLES; n++) {
         read_thermocouple(&thermocouple_temp, nullptr);
-        // SEND CSV FORMATTED ASCII FOR ADAFRUIT BLUEFRUIT CONNECT APP
-        send_value = (uint16_t)(thermocouple_temp * 100.0);
-        sprintf(txt, "%d,\n", send_value);
-        Serial.printf("CSV format: Temperature = %d [dec] = %.2f °C\n", send_value, thermocouple_temp);
-        pTxCharacteristic->setValue(txt);
-        pTxCharacteristic->notify();
+        send_value = (uint16_t)(round(thermocouple_temp * 100.0));
+        if (ble_tx_type == BLE_TX_FORMAT_READABLE) {
+          // SEND TEMPERATURE IN HUMAN READABLE ASCII
+          Serial.printf("Readable format: [Temp=%.2f °C\\n]\n", thermocouple_temp);
+          sprintf(txt, "Temp=%.2f °C\n", thermocouple_temp);
+          pTxCharacteristic->setValue(txt);
+          pTxCharacteristic->notify();
+        } else if (ble_tx_type == BLE_TX_FORMAT_CSV) {
+          // SEND TEMPERATURE IN CSV FORMATTED ASCII FOR PLOTTING (GRAPHING) IN ADAFRUIT BLUEFRUIT CONNECT APP
+          Serial.printf("CSV format: Temperature [%d,\\n] ==> %d DEC = %.2f °C\n", send_value, send_value, thermocouple_temp);
+          sprintf(txt, "%d,\n", send_value);
+          pTxCharacteristic->setValue(txt);
+          pTxCharacteristic->notify();
+        } else if (ble_tx_type == BLE_TX_FORMAT_INTEGER) {
+          // SEND TEMPERATURE IN LITTLE ENDIAN INTEGER ARRAY, PREFIXED WITH ASCII "TE"
+          ble_send_array[0] = 'T';
+          ble_send_array[1] = 'E';
+          ble_send_array[2] = send_value;
+          ble_send_array[3] = send_value >> 8;
+          Serial.printf("Integer array format: Temperature [%c][%c][0x%02X][0x%02X] ==> %d DEC = %.3f °C\n",
+                        ble_send_array[0], ble_send_array[1], ble_send_array[2], ble_send_array[3], send_value, thermocouple_temp);
+          pTxCharacteristic->setValue(ble_send_array, sizeof(ble_send_array));
+          pTxCharacteristic->notify();
+        }
         delay(TYRE_SAMPLE_PERIOD_MS);
       }
     }
@@ -287,7 +328,7 @@ void send_ble_data_2() {
   -----------------
 */
 void button_shortpress() {
-  send_ble_data_2();
+  send_ble_data();
 }
 
 /*
@@ -351,62 +392,6 @@ void tyre_deep_sleep() {
   esp_sleep_enable_ext0_wakeup(GPIO_NUM_33, 0);
   Serial.println("Going to sleep. Press button to wake. Zzzz...");
   esp_deep_sleep_start();
-}
-
-/*
-  -----------------
-  Send Tyre monitor data via BLE UART service
-  -----------------
-*/
-void send_ble_data() {
-  float gauge_pressure = 0.0;
-  float thermocouple_temp = 0.0;
-  char press_txt[30];
-  if (ble_tx_type > 0)
-    Serial.printf("Pressure=%.2f psi, Temperature %.2f°C\n", gauge_pressure, thermocouple_temp);
-
-  switch (ble_tx_type) {
-    case 0:
-      // SEND AS READABLE STRING
-      sprintf(press_txt, "P=%.2fpsi, T=%.2f°C\n", gauge_pressure, thermocouple_temp);
-      Serial.printf("Readable string: %s", press_txt);
-      pTxCharacteristic->setValue(press_txt);
-      pTxCharacteristic->notify();
-      break;
-
-    case 1:
-      // SEND CSV FORMATTED ASCII FOR ADAFRUIT BLUEFRUIT CONNECT APP
-      sprintf(press_txt, "%d,%d\n", (uint16_t)(gauge_pressure * 100.0), (uint16_t)(thermocouple_temp * 100.0));
-      Serial.printf("CSV format: %s", press_txt);
-      pTxCharacteristic->setValue(press_txt);
-      pTxCharacteristic->notify();
-      break;
-
-    case 2:
-      // SEND AS INTEGER ARRAY
-      uint8_t ble_send_array[4];
-      uint16_t ble_val1_int16;
-      uint16_t ble_val2_int16;
-
-      ble_val1_int16 = (uint16_t)(gauge_pressure * 100.0);     // Pressure should always be positive 0.0 - 60.0 psi
-      ble_val2_int16 = (uint16_t)(thermocouple_temp * 100.0);  // Temp should be 0 - 70°C
-
-      ble_send_array[0] = ble_val1_int16;
-      ble_send_array[1] = ble_val1_int16 >> 8;
-      ble_send_array[2] = ble_val2_int16;
-      ble_send_array[3] = ble_val2_int16 >> 8;
-
-      Serial.printf("Integer Array: Pressure=%d dec=[0x%02X] [0x%02X]\n", ble_val1_int16, ble_send_array[0], ble_send_array[1]);
-      Serial.printf("Integer Array: Temperat=%d dec=[0x%02X] [0x%02X]\n", ble_val2_int16, ble_send_array[2], ble_send_array[3]);
-
-      pTxCharacteristic->setValue(ble_send_array, 4);
-      pTxCharacteristic->notify();
-      break;
-
-    default:
-      break;
-  }
-  Serial.println("");
 }
 
 /*
